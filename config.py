@@ -1,6 +1,7 @@
 from transformers import PretrainedConfig
+from typing import final, Any
 
-
+@final
 class ModelConfig(PretrainedConfig):
     """
     Tiny-K 模型配置类，继承自 HuggingFace 的 PretrainedConfig。
@@ -82,7 +83,7 @@ class ModelConfig(PretrainedConfig):
             # 为什么是 8/3?
             #   SwiGLU 有三个权重矩阵 (W_gate, W_up, W_down), 相比标准 FFN (W1, W2)
             #   参数量多 50%, 所以 dim→8/3×dim 来保持总参数量与标准 FFN 一致
-            hidden_dim: int = None,
+            hidden_dim: int = None,  # pyright: ignore[reportArgumentType]
 
             # multiple_of: FFN 隐藏层维度的对齐倍数
             # hidden_dim 会被补齐到该值的整数倍，方便 GPU 硬件加速
@@ -123,19 +124,19 @@ class ModelConfig(PretrainedConfig):
 
             # **kwargs: 传递给父类 PretrainedConfig 的其他参数
             # 如 pad_token_id、bos_token_id、eos_token_id 等
-            **kwargs
-    ):
+            **kwargs: Any  # pyright: ignore[reportExplicitAny, reportAny]
+    ) -> None:
         # 将参数保存为实例属性
-        self.dim = dim
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        self.multiple_of = multiple_of
-        self.norm_eps = norm_eps
-        self.max_seq_len = max_seq_len
-        self.dropout = dropout
-        self.flash_attn = flash_attn
+        self.dim: int = dim
+        self.n_layers: int = n_layers
+        self.n_heads: int = n_heads
+        self.n_kv_heads: int = n_kv_heads
+        self.vocab_size: int = vocab_size
+        self.hidden_dim: int = hidden_dim
+        self.multiple_of: int = multiple_of
+        self.norm_eps: float = norm_eps
+        self.max_seq_len: int = max_seq_len
+        self.dropout: float = dropout
+        self.flash_attn: bool = flash_attn
 
-        super().__init__(**kwargs)
+        super().__init__(**kwargs)  # pyright: ignore[reportAny]

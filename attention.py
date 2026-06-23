@@ -1,7 +1,19 @@
+from torch._tensor import Tensor
+
+
+from torch._tensor import Tensor
+
+
+from torch._tensor import Tensor
+from torch._tensor import Tensor
+from typing import final
 from torch import nn
 import torch
 
 from config import ModelConfig
+
+
+@final
 class Attention(nn.Module):
     """
     Attention 模块: 实现了多头注意力机制的两个关键技术:
@@ -18,21 +30,25 @@ class Attention(nn.Module):
         d_k = head_dim                     缩放因子，防止点积过大导致 softmax 梯度消失
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.n_kv_heads = config.n_kv_heads
-        self.n_heads = config.n_heads
-        self.head_dim = config.dim // config.n_heads
-        self.max_seq_len = config.max_seq_len
-        self.dropout = config.dropout
-        self.flash_attn = config.flash_attn
-        self.norm_eps = config.norm_eps
-        self.hidden_dim = config.hidden_dim
-        self.multiple_of = config.multiple_of
+        self.n_kv_heads: int = config.n_kv_heads
+
+        assert config.n_heads % self.n_kv_heads == 0
+
+        self.n_heads: int = config.n_heads
+        self.head_dim: int = config.dim // config.n_heads
+        self.max_seq_len: int = config.max_seq_len
+        self.dropout: float = config.dropout
+        self.flash_attn: bool = config.flash_attn
+        self.norm_eps: float = config.norm_eps
+        self.hidden_dim: int = config.hidden_dim
+        self.multiple_of: int = config.multiple_of
+
     # =========================================================================
     #  一、GQA (Grouped Query Attention) —— 分组查询注意力
     # =========================================================================
-    def repeat_kv(self, x: torch.Tensor, n_rep: int):
+    def repeat_kv(self, x: torch.Tensor, n_rep: int) -> Tensor:
         """
         将 KV 头复制 n_rep 次，使 KV 头数与 Q 头数对齐。
 
@@ -81,7 +97,7 @@ class Attention(nn.Module):
     # =========================================================================
     #  二、RoPE (Rotary Position Embedding) —— 旋转位置编码
     # =========================================================================
-    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0):
+    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0) -> tuple[Tensor, Tensor]:
         """
         预计算 RoPE 所需的 cos 和 sin 查找表。
 
@@ -124,8 +140,7 @@ class Attention(nn.Module):
         #
         # 公式: θ_i = 1 / (theta^{2i/d}) = theta^{-2i/d}
         # 结果 shape: [dim//2]
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                       [: (dim // 2)].float() / dim))
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
 
         # 步骤 2: 生成位置索引 t = [0, 1, 2, ..., end-1]
         # shape: [end]
@@ -151,7 +166,7 @@ class Attention(nn.Module):
         freqs_cos = torch.cos(freqs)  # cos(pos × θ_i)
         return freqs_cos, freqs_sin
 
-    def reshape_for_broadcast(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+    def reshape_for_broadcast(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> Tensor:
         """
         将 2D 的 cos/sin 表广播到 4D 张量 x 的形状。
 
@@ -189,8 +204,8 @@ class Attention(nn.Module):
         xq: torch.Tensor,
         xk: torch.Tensor,
         freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor
-    ):
+        freqs_sin: torch.Tensor,
+    ) -> tuple[Tensor, Tensor]:
         """
         对 Query 和 Key 应用旋转位置编码 (RoPE)。
 

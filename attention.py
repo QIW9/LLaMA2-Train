@@ -1,11 +1,22 @@
-from torch._tensor import Tensor
+"""
+注意力机制 —— 模型的"眼睛"
 
+通俗理解：
+  当你读一句话"我昨天吃了苹果"，读到"苹果"时，
+  你的大脑会自动关注前面的"吃了"（谁吃？），而不是"昨天"（什么时候？）。
+  
+  注意力机制就是让模型自动学会"看一句话时，每个词应该重点关注哪些其他词"。
 
-from torch._tensor import Tensor
+核心公式（先有个印象）：
+  分数 = Q（我要查什么）× K（别人有什么标签）
+  分数越大 → 越相关 → 权重越大 → V（实际信息）被提取得越多
 
+这个文件实现了两个关键技术：
+  1. GQA：省显存的注意力（多个查询头共享一组键值头）
+  2. RoPE：给每个词打上"位置标签"，让模型知道词的顺序
+"""
 
-from torch._tensor import Tensor
-from torch._tensor import Tensor
+import math
 from typing import final
 from torch import nn
 import torch
@@ -16,186 +27,205 @@ from config import ModelConfig
 @final
 class Attention(nn.Module):
     """
-    Attention 模块: 实现了多头注意力机制的两个关键技术:
-      1. GQA (Grouped Query Attention)  —— 通过 repeat_kv 实现，减少 KV 头数以节省显存
-      2. RoPE (Rotary Position Embedding) —— 旋转位置编码，将位置信息编码为旋转角度注入 Q/K
+    注意力模块
 
-    Attention 核心公式（Scaled Dot-Product Attention）:
-        Attention(Q, K, V) = softmax( Q·K^T / √d_k ) · V
-
-    其中:
-        Q ∈ R^{n_heads × seq_len × d_k}    Query 矩阵（"我要查什么"）
-        K ∈ R^{n_heads × seq_len × d_k}    Key   矩阵（"我有什么标签"）
-        V ∈ R^{n_heads × seq_len × d_v}    Value 矩阵（"我的实际内容"）
-        d_k = head_dim                     缩放因子，防止点积过大导致 softmax 梯度消失
+    数据流（以一句话为例，"今天 天气 真好"）：
+      输入 3 个词 → 每个词算出 Q（查询）、K（标签）、V（内容）
+      → Q×K 算出词与词的关联度 → 根据关联度加权取 V 的信息
+      → 输出每个词"看完上下文后"的新表示
     """
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.n_kv_heads: int = config.n_kv_heads
+        self.n_heads: int = config.n_heads         # 有多少个"注意力头"（多头 = 多个视角同时看）
+        self.n_kv_heads: int = config.n_kv_heads   # 键值头数（可以比 n_heads 少，省显存）
+        self.head_dim: int = config.dim // config.n_heads  # 每个头的维度
+        self.max_seq_len: int = config.max_seq_len
 
+        # n_heads 必须是 n_kv_heads 的整数倍（比如 12 个 Q 头共享 3 个 KV 头，每个 KV 头被 4 个 Q 头共享）
         assert config.n_heads % self.n_kv_heads == 0
 
-        self.n_heads: int = config.n_heads
-        self.head_dim: int = config.dim // config.n_heads
-        self.max_seq_len: int = config.max_seq_len
-        self.dropout: float = config.dropout
-        self.flash_attn: bool = config.flash_attn
-        self.norm_eps: float = config.norm_eps
-        self.hidden_dim: int = config.hidden_dim
-        self.multiple_of: int = config.multiple_of
+        model_parallel_size = 1
+        self.n_local_heads = self.n_heads // model_parallel_size     # 本地的 Q 头数
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size  # 本地的 KV 头数
+        # 每个 KV 头要被几个 Q 头共享（n_rep=4 意思是 1 个 KV 头服务 4 个 Q 头）
+        self.n_rep = self.n_heads // self.n_local_heads
 
-    # =========================================================================
-    #  一、GQA (Grouped Query Attention) —— 分组查询注意力
-    # =========================================================================
-    def repeat_kv(self, x: torch.Tensor, n_rep: int) -> Tensor:
+        # ======== 四个变换矩阵 ========
+        # 它们的作用：把输入的一串数字（dim维），投射到不同的"视角"
+        #
+        # Q（Query，查询）：  "我是'苹果'这个词，我想知道前面谁跟我有关"
+        # K（Key，标签）：    "我是'吃了'这个词，我身上贴着'动作'的标签"
+        # V（Value，内容）：  "我是'吃了'这个词，我的实际含义是xxx"
+        #
+        # Q 和 K 做点积 = 看"查询"和"标签"匹配程度 → 匹配度高的 V 内容被提取
+        # 打个比方：图书馆查资料，Q 是你要找的关键词，K 是每本书的标签，V 是书的内容
+        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)      # 生成 Q
+        self.wk = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)   # 生成 K（头更少，省显存）
+        self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)   # 生成 V（头更少，省显存）
+        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)      # 把所有头的结果拼回去
+
+        # 训练时随机丢弃，防止死记硬背
+        self.att_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
+
+        # 检查 PyTorch 是否内置了 Flash Attention（一种高速注意力算法）
+        # 有就用快的，没有就用自己手写的（慢但能用）
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        if not self.flash:
+            print("WARNING: Flash Attention not available, using slow attention")
+            # 如果没有 Flash Attention，自己手写时需要一个"因果遮罩"
+            # 作用：让"今天"不能偷看"天气"（生成式模型只能看过去，不能看未来）
+            mask = torch.full((1, 1, self.max_seq_len, self.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)  # 上三角设为 -inf（不可见）
+            self.register_buffer("mask", mask)
+
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
         """
-        将 KV 头复制 n_rep 次，使 KV 头数与 Q 头数对齐。
+        前向传播：输入一批词的向量表示，输出它们"看完上下文后"的新表示
 
-        背景:
-          - 标准多头注意力: n_q_heads = n_kv_heads，每个 Q 头对应一个独立的 KV 头
-          - GQA: n_q_heads > n_kv_heads，多个 Q 头共享一组 KV 头
-          - 优势: 大幅减少 KV 缓存，推理时更省显存，实验证明性能损失很小
+        流程：
+        输入 → 算出Q、K、V → 加上位置信息 → Q×K算关联度 → 加权取V → 拼回头 → 输出
+        """
+        bsz, seqlen, _ = x.shape  # 批次数, 句子长度, 向量维度
 
-        数学描述:
-          给定 x ∈ R^{bs × kv_len × n_kv_heads × head_dim},
-          输出 x' ∈ R^{bs × kv_len × (n_kv_heads × n_rep) × head_dim}
-          其中 x'[..., i*n_rep:(i+1)*n_rep, :] = x[..., i:i+1, :]  (每组复制 n_rep 次)
+        # 第1步：用三个矩阵分别生成 Q、K、V
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        示例 (n_kv_heads=2, n_rep=4):
-          输入:  [头A, 头B]           (2 个头)
-          输出:  [头A, 头A, 头A, 头A, 头B, 头B, 头B, 头B]  (8 个头)
+        # 第2步：调整形状，让每个"头"独立
+        # 比如 12 个头，就切成 12 份，每份单独做注意力
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        形状变换流程:
-          [bs, kv_len, n_kv_heads, head_dim]              # 原始 KV
-          → [bs, kv_len, n_kv_heads, 1, head_dim]         # 插入复制维度 (unsqueeze)
-          → [bs, kv_len, n_kv_heads, n_rep, head_dim]    # 沿复制维度广播 (expand)
-          → [bs, kv_len, n_kv_heads*n_rep, head_dim]     # 合并维度 (reshape)
+        # 第3步：给 Q 和 K 加上位置信息（RoPE）
+        # 不加的话模型分不清"饭吃我"和"我吃饭"，因为字一样但顺序不同
+        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
-        参数:
-          x:      KV 张量, shape = [batch_size, kv_len, n_kv_heads, head_dim]
-          n_rep:  每个 KV 头的复制次数, n_rep = n_q_heads / n_kv_heads
-        返回:
-          扩展后的 KV 张量, shape = [batch_size, kv_len, n_q_heads, head_dim]
+        # 第4步：GQA —— 把少的 KV 头复制成和 Q 头一样多
+        # 比如 Q 有 12 个头，KV 只有 3 个头 → 每个 KV 头复制 4 份
+        xk = self.repeat_kv(xk, self.n_rep)
+        xv = self.repeat_kv(xv, self.n_rep)
+
+        # 第5步：调整维度顺序，准备做矩阵乘法
+        # 从 [batch, seqlen, n_heads, head_dim] → [batch, n_heads, seqlen, head_dim]
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 第6步：核心计算 —— Q × K^T → 注意力分数 → 加权 V
+        if self.flash:
+            # 方式A：Flash Attention（快，省显存）
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True  # 因果遮罩：每个词只能看它前面的词
+            )
+        else:
+            # 方式B：手写版（慢，但不需要额外依赖）
+            # Q×K^T / sqrt(head_dim)：算相似度，除以 sqrt 防止数字太大
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # 加上因果遮罩（当前词不能看未来词）
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            # softmax：把分数变成概率（总和=1）
+            scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            # 用概率加权取 V 的信息
+            output = torch.matmul(scores, xv)
+
+        # 第7步：把多个头拼回去
+        # 从 [batch, n_heads, seqlen, head_dim] → [batch, seqlen, n_heads*head_dim]
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        # 第8步：最终变换 + dropout，得到输出
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
+
+    # ============================================================
+    # GQA（分组查询注意力）—— 省显存的技巧
+    # ============================================================
+    def repeat_kv(self, x: torch.Tensor, n_rep: int):
+        """
+        把少的 KV 头复制成和 Q 头一样多。
+
+        为什么需要？
+          标准的全头注意力：Q 有 12 个头，K/V 也有 12 个头 → 一对一配对
+          分组注意力（GQA）：Q 有 12 个头，K/V 只有 3 个头 → 每 4 个 Q 头共享 1 组 K/V
+
+        好处：
+          K/V 头少了 → 推理时缓存的 K/V 小了 4 倍 → 显存省了 4 倍
+          实验证明：效果几乎不下降
+
+        示例（Q 有 8 个头，KV 只有 2 个头，n_rep=4）：
+          K: [头A] [头B]           → 复制后 → [头A][头A][头A][头A][头B][头B][头B][头B]
+          V: [头A] [头B]           → 同理
+
+        用 expand 而不是 repeat：
+          expand 只是"换个视角看同一块数据"，不真正复制内存，0 开销
         """
         bs, kv_len, n_kv_heads, head_dim = x.shape
         if n_rep == 1:
-            return x  # 标准多头注意力，无需复制
+            return x  # 不需要复制，直接返回
 
         return (
-            # 步骤 1: unsqueeze —— 在第 3 维后插入一个维度（复制槽位）
-            # [bs, kv_len, n_kv_heads, head_dim] → [bs, kv_len, n_kv_heads, 1, head_dim]
-            x[:, :, :, None, :]
-            # 步骤 2: expand —— 沿新维度广播 n_rep 次（不拷贝内存，仅改变视图）
-            # [bs, kv_len, n_kv_heads, 1, head_dim] → [bs, kv_len, n_kv_heads, n_rep, head_dim]
-            .expand(bs, kv_len, n_kv_heads, n_rep, head_dim)
-            # 步骤 3: reshape —— 合并 n_kv_heads 和 n_rep，得到完整的 n_q_heads
-            # [bs, kv_len, n_kv_heads, n_rep, head_dim] → [bs, kv_len, n_kv_heads*n_rep, head_dim]
-            .reshape(bs, kv_len, n_kv_heads * n_rep, head_dim)
+            x[:, :, :, None, :]                                   # 插入一个维度
+            .expand(bs, kv_len, n_kv_heads, n_rep, head_dim)      # 广播（不拷贝内存）
+            .reshape(bs, kv_len, n_kv_heads * n_rep, head_dim)    # 合并维度
         )
 
-    # =========================================================================
-    #  二、RoPE (Rotary Position Embedding) —— 旋转位置编码
-    # =========================================================================
-    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0) -> tuple[Tensor, Tensor]:
+    # ============================================================
+    # RoPE（旋转位置编码）—— 给每个词打"位置标签"
+    # ============================================================
+    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0):
         """
-        预计算 RoPE 所需的 cos 和 sin 查找表。
+        提前算好所有位置的"旋转角度表"。
 
-        RoPE 核心思想:
-          将位置信息编码为 2D 平面上的旋转角度，直接注入 Q 和 K。
-          当 Q 和 K 做点积时，旋转角度会自动转化为相对位置信息:
+        通俗理解：
+          每个词都有一个"位置标签"，这个标签是一个角度。
+          - 位置 0 的词转 0°
+          - 位置 1 的词转 30°
+          - 位置 2 的词转 60°
+          ...
 
-            Q_pos_i · K_pos_j = f(内容相似度, 位置差 i-j)
+          两个词的点积会自动包含它们的"角度差"：
+            位置差越小 → 角度差越小 → 点积越大 → 它们越相关
+            位置差越大 → 角度差越大 → 点积越小 → 它们越不相关
 
-          位置越近 → 角度差越小 → 点积越大 → 注意力权重越高
-          位置越远 → 角度差越大 → 点积越小 → 注意力权重越低
+          这就让模型天然知道了"距离近的词更相关"。
 
-        频率计算（每个维度对的旋转速度不同）:
-          Θ = { θ_i = theta^{-2i/d} | i = 0, 1, ..., d/2 - 1 }
+        原理：
+          给每个维度对分配一个不同的"旋转速度"：
+            高频维度（转得快）→ 捕捉精细的局部关系
+            低频维度（转得慢）→ 捕捉大范围的长距离关系
 
-          其中:
-            theta = 10000.0 (默认，来自原始 Transformer 论文)
-            d = dim (head_dim)
-            i = 维度对的索引 (共 d/2 对)
+        公式：
+          对于位置 pos，第 i 个维度对旋转角度 = pos × (1 / 10000^(2i/dim))
 
-          θ_0 = 1.0          → 高频，旋转快（捕捉局部模式）
-          θ_{d/2-1} = 1/theta → 低频，旋转慢（捕捉长程依赖）
-
-        旋转角度表:
-          对每个位置 pos 和每个维度对 i:
-            角度 = pos × θ_i
-
-          最终得二维表:
-            freqs[pos][i] = pos × θ_i    (shape: [seq_len, dim/2])
-
-        返回:
-          freqs_cos: cos 值表, shape = [end, dim//2]
-          freqs_sin: sin 值表, shape = [end, dim//2]
+        返回值：
+          freqs_cos: cos(角度),  形状 [序列长度, dim//2]
+          freqs_sin: sin(角度),  形状 [序列长度, dim//2]
         """
-        # 步骤 1: 计算各维度对的频率 θ_i
-        # torch.arange(0, dim, 2) → [0, 2, 4, ..., dim-2], 共 dim//2 个值
-        # 除以 dim 并取前 dim//2 个值 → [0/d, 2/d, 4/d, ..., (dim-2)/d]
-        # theta^{...} → 负指数衰减, 使得高频到低频递减
-        # 取倒数 → 频率值 θ_i (高频→大值, 低频→小值)
-        #
-        # 公式: θ_i = 1 / (theta^{2i/d}) = theta^{-2i/d}
-        # 结果 shape: [dim//2]
+        # 算每个维度对的基础频率：theta 越大频率越低，转得越慢
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-
-        # 步骤 2: 生成位置索引 t = [0, 1, 2, ..., end-1]
-        # shape: [end]
+        # 位置编号: 0, 1, 2, ..., end-1
         t = torch.arange(end, device=freqs.device)
-
-        # 步骤 3: 计算旋转角度矩阵（外积）
-        # outer(t, freqs) → t × freqs^T
-        # freqs[pos][i] = pos × θ_i
-        # shape: [end, dim//2]
-        #
-        # 示意图 (dim//2=4, end=5):
-        #        θ₀     θ₁     θ₂     θ₃
-        # pos0: 0×θ₀   0×θ₁   0×θ₂   0×θ₃
-        # pos1: 1×θ₀   1×θ₁   1×θ₂   1×θ₃
-        # pos2: 2×θ₀   2×θ₁   2×θ₂   2×θ₃
-        # pos3: 3×θ₀   3×θ₁   3×θ₂   3×θ₃
-        # pos4: 4×θ₀   4×θ₁   4×θ₂   4×θ₃
+        # 每个位置 × 每个频率 = 角度矩阵 [end, dim//2]
         freqs = torch.outer(t, freqs).float()
-
-        # 步骤 4: 计算 cos 和 sin 表
-        # 每个位置 pos 和维度对 i 都有唯一的角度值
-        freqs_sin = torch.sin(freqs)  # sin(pos × θ_i)
-        freqs_cos = torch.cos(freqs)  # cos(pos × θ_i)
+        # 取 cos 和 sin
+        freqs_cos = torch.cos(freqs)
+        freqs_sin = torch.sin(freqs)
         return freqs_cos, freqs_sin
 
-    def reshape_for_broadcast(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> Tensor:
+    def reshape_for_broadcast(self, x: torch.Tensor, freqs_cis: torch.Tensor):
         """
-        将 2D 的 cos/sin 表广播到 4D 张量 x 的形状。
-
-        背景:
-          - cos/sin 是二维表: [seq_len, dim//2]
-          - QK 是四维张量: [batch, seq_len, n_heads, dim//2]
-          - 需要通过广播机制让 cos/sin 可以逐元素与 QK 相乘
-
-        PyTorch 广播规则:
-          从右往左对齐维度, 缺失的维度自动补 1:
-          原始:            [seq_len, dim//2]
-          目标 (view后):   [1,       seq_len, 1,      dim//2]
-          QK:              [batch,   seq_len, n_heads, dim//2]
-          → 广播后:        [batch,   seq_len, n_heads, dim//2]  ✓
-
-        参数:
-          x:         参考张量 (xq_r 或 xk_r), 用于确定目标形状
-                     shape = [batch, seq_len, n_heads, dim//2]
-          freqs_cis: cos 或 sin 表
-                     shape = [seq_len, dim//2]
-        返回:
-          广播后的 cos/sin, view 为 [1, seq_len, 1, dim//2]
+        把 2D 的角度表 [seqlen, dim//2] 变形为 4D [1, seqlen, 1, dim//2]，
+        这样就能和 Q/K 的形状 [batch, seqlen, n_heads, dim//2] 做逐元素乘法（自动广播）。
         """
-        ndim = x.ndim  # 张量维度数: 4
-        assert 0 <= 1 < ndim
-        # 验证形状匹配: cos/sin 表的行数=seq_len, 列数=head_dim//2
+        ndim = x.ndim
         assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-        # 构造 view 形状: 只在 seq_len 维度(第1维)和最后一维保持原样, 其余补 1
-        # 例如 x.shape = [2, 32, 8, 64] → shape = [1, 32, 1, 64]
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return freqs_cis.view(*shape)
 
@@ -205,73 +235,40 @@ class Attention(nn.Module):
         xk: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ):
         """
-        对 Query 和 Key 应用旋转位置编码 (RoPE)。
+        给 Q 和 K 施加旋转（加上位置信息）。
 
-        核心 —— 2D 平面旋转公式:
-          将 head_dim 两两配对，每对 (x_r, x_i) 看作 2D 平面上的向量。
-          以角度 θ = pos × freq 旋转该向量:
+        原理：把每个词的头维度两两分组，每组看成一个 2D 向量，
+        然后按该位置的角度旋转这个向量。
 
-            [ x_r' ]   [ cos(θ)  -sin(θ) ] [ x_r ]
-            [ x_i' ] = [ sin(θ)   cos(θ) ] [ x_i ]
+        旋转公式（2D 旋转矩阵）：
+          新实部 = 实部 × cos(θ) - 虚部 × sin(θ)
+          新虚部 = 实部 × sin(θ) + 虚部 × cos(θ)
 
-          展开:
-            x_r' = x_r × cos(θ) - x_i × sin(θ)    ← 旋转后的实部
-            x_i' = x_r × sin(θ) + x_i × cos(θ)    ← 旋转后的虚部
+        为什么只转 Q 和 K，不转 V？
+          位置信息是通过 Q×K 点积引入的。
+          Q 转了角度 pos_m，K 转了角度 pos_n，
+          点积结果 ≈ cos(pos_m - pos_n) × 内容 → 自动包含相对位置！
 
-        RoPE 的性质（基于复数乘法）:
-          设 Q_pos_m 旋转了 m×θ, K_pos_n 旋转了 n×θ,
-          则 Q_pos_m · K_pos_n ∝ cos((m-n)×θ) + 其它项
-          → 点积天然包含相对位置 (m-n) 信息!
-
-        步骤概览:
-          1. 将 head_dim 拆分成 dim//2 对, 每对看作复数的 (实部, 虚部)
-          2. 广播 cos/sin 表到 QK 同形状
-          3. 执行 2D 旋转变换
-          4. 将实部虚部拼回原始形状
-
-        参数:
-          xq:        Query 张量, shape = [batch, seq_len, n_heads, head_dim]
-          xk:        Key   张量, shape = [batch, seq_len, n_kv_heads, head_dim]
-          freqs_cos: 预计算的 cos 表, shape = [seq_len, head_dim//2]
-          freqs_sin: 预计算的 sin 表, shape = [seq_len, head_dim//2]
-        返回:
-          (xq_out, xk_out): 旋转后的 Query 和 Key, 形状与输入一致
+        V 存的是"实际内容"，不需要位置信息（位置已经在 Q×K 里体现了）。
         """
-        # --- 步骤 1: 将 head_dim 拆分成 dim//2 对, 每对 (实部, 虚部) ---
-        # xq.shape = [bs, seq_len, n_heads, head_dim=128]
-        # reshape → [bs, seq_len, n_heads, 64, 2]
-        # unbind(-1) → 沿最后一维拆分, 得到实部和虚部
-        # xq_r, xq_i shape 均为 [bs, seq_len, n_heads, 64]
+        # 把 head_dim 的最后两维度拆成 (dim//2, 2)，看成实部和虚部
         xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
         xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
 
-        # --- 步骤 2: 广播 cos/sin 表到 QK 同形状 ---
-        # view 前: [seq_len, 64] → view 后: [1, seq_len, 1, 64]
-        # 乘法时自动广播到 [bs, seq_len, n_heads, 64]
+        # 广播 cos/sin 表和 Q/K 同形状
         freqs_sin = self.reshape_for_broadcast(xq_r, freqs_sin)
         freqs_cos = self.reshape_for_broadcast(xq_r, freqs_cos)
 
-        # --- 步骤 3: 执行 2D 旋转变换 ---
-        # 对每一对 (x_r, x_i) 应用旋转:
-        #   x_r' = x_r × cos(θ) - x_i × sin(θ)
-        #   x_i' = x_r × sin(θ) + x_i × cos(θ)
-        #
-        # 解释: 这相当于将向量 (x_r, x_i) 在 2D 平面上逆时针旋转了角度 θ
-        # θ = pos × freq, 所以不同位置的词旋转不同角度
-        xq_r_out = xq_r * freqs_cos - xq_i * freqs_sin
-        xq_i_out = xq_r * freqs_sin + xq_i * freqs_cos
+        # 2D 旋转：把 (实部, 虚部) 向量旋转 θ 角度
+        xq_r_out = xq_r * freqs_cos - xq_i * freqs_sin   # 旋转后的实部
+        xq_i_out = xq_r * freqs_sin + xq_i * freqs_cos   # 旋转后的虚部
         xk_r_out = xk_r * freqs_cos - xk_i * freqs_sin
         xk_i_out = xk_r * freqs_sin + xk_i * freqs_cos
 
-        # --- 步骤 4: 拼回原始形状 ---
-        # stack(..., dim=-1) → [bs, seq_len, n_heads, 64, 2]
-        # flatten(3) → [bs, seq_len, n_heads, 128]
-        # 实现: 将最后一维交错排列 (r0,i0, r1,i1, r2,i2, ...)
+        # 把实部虚部拼回去
         xq_out = torch.stack([xq_r_out, xq_i_out], dim=-1).flatten(3)
         xk_out = torch.stack([xk_r_out, xk_i_out], dim=-1).flatten(3)
 
-        # --- 步骤 5: 转回原始数据类型并返回 ---
-        # .type_as() 确保输出与输入的数据类型一致（如 bfloat16）
         return xq_out.type_as(xq), xk_out.type_as(xk)
